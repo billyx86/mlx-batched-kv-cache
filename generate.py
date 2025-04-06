@@ -1,13 +1,89 @@
-from typing import List
 import mlx.core as mx
 import time
 import argparse
+import os
+import json
+from typing import List, Tuple, Dict, Generator
+from transformers import AutoTokenizer
 from model import Transformer
 
-# Simulated tokenizer
-EOS_TOKEN_ID = -1
-PAD_TOKEN_ID = -2
-VOCAB_SIZE = 1000
+def load_model(model_path: str) -> Tuple[Transformer, AutoTokenizer, Dict]:
+    """
+    Loads the MLX model, tokenizer, and configuration from a specified path.
+
+    Args:
+        model_path (str): Path to the directory containing model weights, config, and tokenizer.
+
+    Returns:
+        Tuple[Transformer, AutoTokenizer, Dict]: Loaded model, tokenizer, and config.
+    """
+    print(f"Loading model from {model_path}...")
+    start_load = time.time()
+
+    config_path = os.path.join(model_path, "config.json")
+    weights_path = os.path.join(model_path, "weights.safetensors")
+    tokenizer_path = model_path
+
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found at {config_path}")
+    if not os.path.exists(weights_path):
+        raise FileNotFoundError(f"Weights file not found at {weights_path}")
+    if not os.path.isdir(tokenizer_path):
+         raise FileNotFoundError(f"Tokenizer path not found at {tokenizer_path}")
+
+    # Load configuration
+    try:
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        print("Configuration loaded.")
+    except json.JSONDecodeError:
+        raise ValueError(f"Error decoding JSON from {config_path}")
+    except Exception as e:
+        raise RuntimeError(f"Error loading config: {e}")
+
+    # Load tokenizer
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        print("Tokenizer loaded.")
+    except Exception as e:
+        raise RuntimeError(f"Error loading tokenizer: {e}")
+
+    # Instantiate the model using the loaded config
+    try:
+        model = Transformer(config=config)
+        print("Model structure initialized.")
+    except Exception as e:
+        raise RuntimeError(f"Error initializing model structure: {e}")
+
+    # Load weights, handling potential 'model.' prefix
+    try:
+        print(f"Loading weights from {weights_path}...")
+        weights = mx.load(weights_path)
+        
+        # Remove 'model.' prefix if present
+        weights = {k.replace("model.", ""): v for k, v in weights.items()}
+        
+        model.update(weights) # Use update with the processed dictionary
+        # model.load_weights(weights_path) # Original call replaced
+        print("Weights loaded and applied.")
+        
+    except Exception as e:
+        print(f"Error loading weights from {weights_path}: {e}")
+        print("Ensure the model structure in model.py matches the weight names/shapes in the file (after potential prefix removal).")
+        raise RuntimeError("Weight loading failed.")
+
+    # Ensure weights are loaded before proceeding
+    mx.eval(model.parameters())
+
+    # Ensure tokenizer has pad token if needed later (though not used in batch_size=1)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        print("Set tokenizer pad_token to eos_token.")
+
+    load_time = time.time() - start_load
+    print(f"Model, tokenizer, and weights loaded in {load_time:.2f}s")
+
+    return model, tokenizer, config
 
 def greedy_sample(logits: mx.array) -> mx.array:
     """
@@ -20,147 +96,129 @@ def greedy_sample(logits: mx.array) -> mx.array:
     # Convert logits to probabilities
     return mx.argmax(logits, axis=-1)
 
-def batch_generate(
+def generate_stream(
         model: Transformer,
-        prompts: mx.array,  # (batch_size, prompt_len)
+        tokenizer: AutoTokenizer,
+        prompt: str,
         max_new_tokens: int,
-        temperature: float = 0.0,  # 0.0 for greedy sampling
-        eos_token_id: int = EOS_TOKEN_ID,
-    ) -> List[List[int]]:
+        temperature: float = 0.0,
+) -> Generator[str, None, None]:
     """
-    Generates token sequences for a batch of prompts using KV caching.
-    
-    args:
-        model (Transformer): The transformer model for generation.
-        prompts (mx.array): Input token ID sequences.
-        max_new_tokens (int): Maximum number of new tokens to generate per sequence.
-        temperature (float): Sampling temperature. 0.0 for greedy sampling. (Not yet implemented)
-        eos_token_id (int): End-of-sequence token ID.
-    returns:
-        List[List[int]]: Token ID indicating the end of a sequence.
+    Generates text token by token for a single prompt using KV caching.
+    Yields the generated text delta at each step.
+
+    Args:
+        model (Transformer): The loaded Transformer model instance.
+        tokenizer (AutoTokenizer): The loaded tokenizer.
+        prompt (str): The input prompt string.
+        max_new_tokens (int): Maximum number of new tokens to generate.
+        temperature (float): Sampling temperature. 0.0 means greedy. (Not fully implemented yet).
+
+    Yields:
+        Generator[str, None, None]: Yields text delta at each generation step.
     """
     if temperature != 0.0:
-        # TODO: Implement sampling strategies like top-k, top-p for temp > 0
         print("Warning: Temperature > 0.0 requested, but only greedy sampling (temp=0.0) is implemented. Using greedy.")
+        # TODO: Implement proper temperature sampling
 
-    batch_size, prompt_len = prompts.shape
-    generated_sequences = [[] for _ in range(batch_size)]
-    active_mask = mx.ones(batch_size, dtype=mx.bool_) # Track which sequences are still generating
+    print("Encoding prompt...")
+    # Encode the prompt, add_special_tokens=True might be needed for some models
+    prompt_ids_np = tokenizer.encode(prompt, add_special_tokens=False, return_tensors="np")
+    prompt_ids = mx.array(prompt_ids_np)
 
-    print(f"Starting batched generation for batch size {batch_size}...")
-    print(f"Processing initial prompt (length {prompt_len})...")
+    if prompt_ids.shape[1] == 0:
+        raise ValueError("Prompt is empty after encoding.")
+        return
+    
+    print(f"Processing prompt ({prompt_ids.shape[1]} tokens)...")
     start_time = time.time()
 
-    # Process prompt phase (initialise KV caches)
-    _, kv_caches = model(prompts, past_kv_caches=None)
-
-    current_token = prompts[:, -1:]  # (batch_size, 1)
+    # Process the prompt to initialize KV caches
+    _, kv_caches = model(prompt_ids, past_kv_caches=None)
+    current_token = prompt_ids[:, -1:]
     logits, kv_caches = model(current_token, past_kv_caches=kv_caches)
 
+    prompt_time = time.time() - start_time
+    print(f"Prompt processing time: {prompt_time:.4f} seconds")
 
-    prompt_processing_time = time.time() - start_time
-    print(f"Prompt processing time: {prompt_processing_time:.4f} seconds")
-    print("Starting token-by-token generation loop...")
+    # Generation Loop Phase
+    generated_token_ids = []
+    current_decoded_text = ""
+    print("Generating tokens...")
     loop_start_time = time.time()
 
-    # logits shape: (batch_size, 1, vocab_size)
     for i in range(max_new_tokens):
         step_start_time = time.time()
 
         if temperature == 0.0:
-            next_token = greedy_sample(logits) # (batch_size, 1)
+            next_token = greedy_sample(logits)
         else:
-            next_token = greedy_sample(logits) # Placeholder for temperature sampling
-        
-        # next_token_val = next_token.item()
-        next_token_list = next_token.tolist()
+            next_token = greedy_sample(logits)  # Placeholder for temperature sampling
 
-        for idx in range(batch_size):
-            if active_mask[idx].item():
-                generated_sequences[idx].append(next_token_list[idx][0])
+        token_id = next_token.item()
+        generated_token_ids.append(token_id)
 
-        # Update the active mask
-        just_finished = (next_token == eos_token_id)
-        active_mask = active_mask & (~just_finished.squeeze(axis=-1))
-
-        # Stop if all sequences have generated EOS
-        if not active_mask.any():
-            print(f"All sequences finished generating at step {i}.")
+        if token_id == tokenizer.eos_token_id:
+            print(f"\nEnd of sequence token encountered at step {i}.")
             break
+            
+        # Decode the newly generated token only to yield delta
+        # This might produce partial unicode sequences, handle carefully
+        # Attempting to decode incrementally
+        current_sequence = generated_token_ids
+        # Use skip_special_tokens=True to avoid printing EOS
+        new_decoded_text = tokenizer.decode(current_sequence, skip_special_tokens=True)
 
-        # Prepare input for the next step
-        current_token = next_token
+        # Calculate and yield the delta
+        text_delta = new_decoded_text[len(current_decoded_text):]
+        current_decoded_text = new_decoded_text # Update the full decoded text
+        yield text_delta # Yield the newly generated chunk
 
-        # Call the model for the next step
+        # Prepare for next iteration
+        current_token = next_token.reshape((1, 1))  # Reshape for the model input
         logits, kv_caches = model(current_token, past_kv_caches=kv_caches)
-
-        # Evaluate tensors
-        mx.eval(logits, kv_caches)
+        mx.eval(logits, kv_caches) # Evaluate for the next step
 
         step_time = time.time() - step_start_time
-        if (i + 1) % 10 == 0:
-            print(f"Step {i + 1}/{max_new_tokens} completed in {step_time:.4f} seconds.")
-
+        print(f"\nStep {i + 1}/{max_new_tokens} completed in {step_time:.4f} seconds.\n\n")
+    
     loop_time = time.time() - loop_start_time
-    total_tokens = sum(len(seq) for seq in generated_sequences)
-    print(f"\nGeneration loop time: {loop_time:.4f} seconds")
-    print(f"Total tokens generated: {total_tokens} across {batch_size} sequences")
-    if loop_time > 0 and total_tokens > 0:
-        print(f"Average tokens per second: {total_tokens / loop_time:.2f} tokens/sec")
-
-    return generated_sequences
-
+    total_gen_tokens = len(generated_token_ids)
+    print(f"\nGeneration loop finished in {loop_time:.4f} seconds")
+    print(f"Total tokens generated: {total_gen_tokens}")
+    if loop_time > 0 and total_gen_tokens > 0:
+        print(f"Average tokens per second: {total_gen_tokens / loop_time:.2f} tokens/sec")
 
 if __name__ == "__main__":
-    # TODO: Use argparse for proper command-line argument handling
-    # Model Configuration (should match model.py example or loaded model)
-    batch_size = 2
-    prompt_len = 5
-    vocab_size = VOCAB_SIZE
-    num_layers = 4
-    dims = 128
-    num_heads = 4
-    mlp_dims = dims * 4
+    parser = argparse.ArgumentParser(description="Generate text using a pre-trained MLX model with KV caching.")
+    parser.add_argument("--model-path", type=str, required=True, help="Path to the directory containing MLX model weights, config, and tokenizer.")
+    parser.add_argument("--prompt", type=str, required=True, help="Input prompt for text generation.")    
+    parser.add_argument("--max-tokens", type=int, default=100, help="Maximum number of new tokens to generate.")
+    parser.add_argument("--temp", type=float, default=0.0, help="Sampling temperature (0.0 for greedy).")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
 
-    max_new_tokens = 50
+    args = parser.parse_args()
 
-    eos_token_id_for_test = 999
+    mx.random.seed(args.seed)
 
-    print("Initializing model...")
+    try:
+        model, tokenizer, config = load_model(args.model_path)
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        exit(1)
+    
+    print((f"\nPrompt: {args.prompt}"))
 
-    model = Transformer(
-        vocab_size=vocab_size,
-        num_layers=num_layers,
-        dims=dims,
-        num_heads=num_heads,
-        mlp_dims=mlp_dims
-    )
-    # Note: model is randomly initialized, so results will not be meaningful
-    # Load pre-trained weights if available
-    # model.load_weights('path_to_weights.safetensors')
+    print("\nGeneration")
+    full_response = ""
+    for text_delta in generate_stream(
+            model=model,
+            tokenizer=tokenizer,
+            prompt=args.prompt,
+            max_new_tokens=args.max_tokens,
+            temperature=args.temp
+    ):
+        print(text_delta, end="", flush=True)
+        full_response += text_delta
 
-    # Dummy batched prompt
-    prompt1 = list(range(1, prompt_len+1))
-    prompt2 = list(range(10, 10 + prompt_len))
-    prompts_list = [prompt1, prompt2]
-
-    if len(prompts_list) != batch_size:
-        print(f"Warning: Expected {batch_size} prompts, but got {len(prompts_list)}. Adjusting to match batch size.")
-        batch_size = len(prompts_list)
-
-    prompts_mx = mx.array(prompts_list)  # (batch_size, prompt_len)
-
-    print(f"\nRunning batch generation with batch_size={batch_size}, max_new_tokens={max_new_tokens}...")
-
-    generated_results = batch_generate(
-        model=model,
-        prompts=prompts_mx,
-        max_new_tokens=max_new_tokens,
-        eos_token_id=eos_token_id_for_test
-    )
-
-    print("\nGenerated sequences:")
-    for i, seq in enumerate(generated_results):
-        print(f"Sequence {i+1}: {seq}")
-
-    print("\nBatch generation completed.")
+    print("\n\nGeneration complete.")
