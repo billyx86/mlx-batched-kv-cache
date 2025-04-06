@@ -3,33 +3,92 @@ import mlx.nn as nn
 import math
 from typing import Optional, Tuple, List, Dict
 
+class RoPE(nn.Module):
+    """
+    Implements Rotary Positional Encoding (RoPE) for Transformer models.
+    """
+    def __init__(self, dims: int, traditional: bool = False, base: float = 10000.0):
+        super().__init__()
+        self.dims = dims
+        self.traditional = traditional
+        self.base = base
+        self.inv_freq = self._compute_inv_freq()
+
+    def _compute_inv_freq(self):
+        return 1.0 / (self.base ** (mx.arange(0, self.dims, 2, dtype=mx.float32) / self.dims))
+    
+    def __call__(self, x: mx.array, offset: int = 0) -> mx.array:
+        """
+        Applies RoPE to the input tensor.
+        
+        args:
+            x (mx.array): Input tensor of shape (batch_size, num_heads, seq_len, head_dim).
+            offset (int): The starting position offset for sequences.
+        
+        returns:
+            mx.array: Tensor with RoPE applied.
+        """
+        seq_len = x.shape[1]
+        positions = mx.arange(offset, offset + seq_len, dtype=self.inv_freq.dtype)
+
+        # Calculate frequencies and embeddings
+        freqs = mx.outer(positions, self.inv_freq)
+        # Shape: (seq_len, dims / 2) -> (1, 1, seq_len, dims / 2) for broadcasting
+        freqs = freqs.reshape(1, 1, seq_len, -1)
+
+        emb = mx.concatenate([freqs, freqs], axis=-1)  # (1, 1, seq_len, dims)
+
+        cos_emb = mx.cos(emb)
+        sin_emb = mx.sin(emb)
+
+        # Apply rotation based on trad. or alt RoPE implementation
+        if self.traditional:
+            x1 = x[..., : self.dims // 2]
+            x2 = x[..., self.dims // 2:]
+            rotated_x = mx.concatenate([-x2, x1], axis=-1)
+            return (x * cos_emb) + (rotated_x * sin_emb)
+        else:
+            # Reshape x for complex multiplication: (..., seq_len, dims) -> (..., seq_len, dims/2, 2)
+            x_complex = x.astype(mx.float32).reshape(*x.shape[:-1], -1, 2)
+            x_complex = mx.complex(x_complex[..., 0], x_complex[..., 1])
+
+            # Reshape emb for complex multiplication: (..., seq_len, dims) -> (..., seq_len, dims/2*2) -> (..., seq_len, dims/2)
+            emb_complex = emb.reshape(*emb.shape[:-1], -1, 2)
+            # Convert to complex numbers: cos(emb) + i * sin(emb)
+            emb_complex = mx.exp(mx.multiply(emb_complex[..., 1], 1j)) # Equivalent to cos + i*sin
+
+            # Apply rotation in complex plane: x * exp(i * emb)
+            rotated_x_complex = x_complex * emb_complex
+            # Reshape back: (..., seq_len, dims/2) -> (..., seq_len, dims)
+            rotated_x = mx.concatenate([rotated_x_complex.real, rotated_x_complex.imag], axis=-1)
+
+            return rotated_x.astype(x.dtype)
+
 class Attention(nn.Module):
-    def __init__(self, dims: int, num_heads: int):
+    def __init__(self, dims: int, num_heads: int, num_kv_heads: int):
         """
         dims (int): The feature dimensions of the input
         num_heads (int): The number of attention heads
         """
         super().__init__()
 
-        if dims % num_heads != 0:
-            raise ValueError(f"Number of heads {num_heads} must evenly divide the feature dimensions {dims}.")
-        
         self.num_heads = num_heads
+        self.num_kv_heads = num_kv_heads
+
         self.head_dim = dims // num_heads
         self.scale = self.head_dim ** -0.5
 
-        # Linear layers for query, key, and value projections
-        self.q_proj = nn.Linear(dims, dims, bias=False)
-        self.k_proj = nn.Linear(dims, dims, bias=False)
-        self.v_proj = nn.Linear(dims, dims, bias=False)
+        self.wq = nn.Linear(dims, num_heads * self.head_dim, bias=False)
+        self.wk = nn.Linear(dims, num_kv_heads * self.head_dim, bias=False)
+        self.wv = nn.Linear(dims, num_kv_heads * self.head_dim, bias=False)
+        self.wo = nn.Linear(num_heads * self.head_dim, dims, bias=False)
 
-        # Linear layer for output projection
-        self.o_proj = nn.Linear(dims, dims, bias=False)
-    
     def __call__(self,
                  x: mx.array,
                  mask: Optional[mx.array] = None,
-                 cache: Optional[Tuple[mx.array, mx.array]] = None
+                 cache: Optional[Tuple[mx.array, mx.array]] = None,
+                 rope: RoPE = None,
+                 offset: int = 0
                  ) -> Tuple[mx.array, Tuple[mx.array, mx.array]]:
         """
         Forward pass for the attention layer.
@@ -37,20 +96,28 @@ class Attention(nn.Module):
         x (mx.array): Input tensor of shape (batch_size, seq_len, dims).
         mask (mx.array, optional): Attention mask of shape (batch_size, 1, 1, seq_len).
         cache (Tuple[mx.array, mx.array], optional): Cached key and value tensors for fast decoding.
+        rope (RoPE, optional): RoPE instance for positional encoding.
+        offset (int): The starting position offset for sequences.
         """
         batch_size, seq_len, dims = x.shape
 
         # Project Q, K, V for current input
-        queries = self.q_proj(x)    # (batch_size, seq_len, dims)
-        keys = self.k_proj(x)       # (batch_size, seq_len, dims)
-        values = self.v_proj(x)     # (batch_size, seq_len, dims)
+        queries = self.wq(x)    # (batch_size, seq_len, dims)
+        keys = self.wk(x)       # (batch_size, seq_len, dims)
+        values = self.wv(x)     # (batch_size, seq_len, dims)
 
         # Reshape and transpose for multi-head attention
         queries = queries.reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        keys = keys.reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
-        values = values.reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(0, 2, 1, 3)
+        keys = keys.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
+        values = values.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        # Update KV cache if provided
+        # Apply RoPE before caching
+        if rope is not None:
+            raise ValueError("RoPE module must be provided to Attention layer.")
+        queries = rope(queries, offset=offset)
+        keys = rope(keys, offset=offset)
+
+        # Update KV cache
         if cache is not None:
             key_cache, value_cache = cache
             print(f"Key cache shape: {key_cache.shape}, Value cache shape: {value_cache.shape}")
@@ -59,7 +126,16 @@ class Attention(nn.Module):
             values = mx.concat([value_cache, values], axis=2)
             print(f"Concatenated keys shape: {keys.shape}, Concatenated values shape: {values.shape}")
 
+        # Handle GQA / MQA
+        if self.num_heads < self.num_kv_heads:
+            num_repeats = self.num_heads // self.num_kv_heads
+            keys = mx.repeat(keys, repeats=num_repeats, axis=1)
+            values = mx.repeat(values, repeats=num_repeats, axis=1)
+
         # Perform scaled dot-product attention
+        # queries: (B, nq, L, D)
+        # keys:    (B, nq, S_full, D)
+        # scores:  (B, nq, L, S_full)
         scores = (queries @ keys.transpose(0, 1, 3, 2)) * self.scale  # (batch_size, num_heads, seq_len, seq_len)
 
         # Apply mask if provided
@@ -67,55 +143,61 @@ class Attention(nn.Module):
             print(f"mask shape: {mask.shape}")
             scores = scores + mask
 
-        # Apply softmax to get attention weights and apply to values
-        attention_weights = mx.softmax(scores, axis=-1)
+        # Apply softmax to get attention weights and apply to values, float32 for stability
+        attention_weights = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
+        
+        # attention_weights: (B, nq, L, S_full)
+        # values:            (B, nq, S_full, D)
+        # attention_output:  (B, nq, L, D)
         attention_output = attention_weights @ values 
 
-        # Reshape and transpose back to original dimensions
-        output_concat = attention_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, dims)  # (batch_size, seq_len, dims)
+        # Reshape and Project Output 
+        # (B, nq, L, D) -> (B, L, nq, D) -> (B, L, nq*D) = (B, L, dims)
+        output_concat = attention_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+        output = self.wo(output_concat)
 
         # Final linear projection
-        output = self.o_proj(output_concat)
+        return output, (keys[:, :self.num_kv_heads, :, :], values[:, :self.num_kv_heads, :, :])
 
-        return output, (keys, values)
-    
 
 class FeedForward(nn.Module):
     def __init__(self, dims: int, hidden_dims: int):
         super().__init__()
 
-        self.w1 = nn.Linear(dims, hidden_dims, bias=False)
-        self.w2 = nn.Linear(hidden_dims, dims, bias=False)
+        self.w1 = nn.Linear(dims, hidden_dims, bias=False)  # Gating MLP
+        self.w2 = nn.Linear(hidden_dims, dims, bias=False)  # Down projectiom
+        self.w3 = nn.Linear(dims, hidden_dims, bias=False)  # Activation MLP
 
-        self.act = nn.GELU()
     
-    def __call__(self, x: mx.array) -> mx.array:  
-        # (B, L, D) -> (B, L, H) -> (B, L, D)
-        return self.w2(self.act(self.w1(x)))
+    def __call__(self, x: mx.array) -> mx.array: 
+        # silu(w1(x)) * w3(x) 
+        gate = self.w1(x)
+        activation = nn.silu(gate) * self.w3(x)
+
+        return self.w2(activation) 
     
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dims: int, num_heads: int, mlp_dimms: int):
-        """
-        dims (int): The feature dimensions of the input
-        num_heads (int): The number of attention heads
-        mlp_dims (int): The hidden dimensions of the feed-forward network
-        """
+    """
+    Transformer block aligned with RMSNorm, RoPE, SwiGLU FFN.
+    """
+    def __init__(self, dims: int, num_heads: int, num_kv_heads: int, mlp_dims: int, norm_eps: float = 1e-5):
         super().__init__()
         self.n_heads = num_heads
         self.dims = dims
 
-        self.ln1 = nn.LayerNorm(dims)
-        self.ln2 = nn.LayerNorm(dims)
+        self.attention_norm = nn.RMSNorm(dims, eps=norm_eps)
+        self.ffn_norm = nn.RMSNorm(dims, eps=norm_eps)
 
-        self.attention = Attention(dims, num_heads)
-
-        self.ffn = FeedForward(dims, mlp_dimms)
+        self.attention = Attention(dims, num_heads, num_kv_heads)
+        self.feed_forward = FeedForward(dims, hidden_dims=mlp_dims)
     
     def __call__(self,
                  x: mx.array,
                  mask: Optional[mx.array] = None,
-                 cache: Optional[Tuple[mx.array, mx.array]] = None
+                 cache: Optional[Tuple[mx.array, mx.array]] = None,
+                 rope: RoPE = None,
+                 offset: int = 0
                  ) -> Tuple[mx.array, Tuple[mx.array, mx.array]]:
         """
         Forward pass for the transformer block.
@@ -123,6 +205,8 @@ class TransformerBlock(nn.Module):
             x (mx.array): Input tensor of shape (batch_size, sequence_len, dims).
             mask (mx.array, optional): Attention mask.
             cache (Tuple[mx.array, mx.array], optional): KV cache for attention layer.
+            rope (RoPE, optional): RoPE instance for positional encoding.
+            offset (int): The starting position offset for sequences.
 
         returns:
 §         Tuple[mx.array, Tuple[mx.array, mx.array]]:
@@ -130,49 +214,61 @@ class TransformerBlock(nn.Module):
             - Updated KV cache.
         """
 
-        # Attention path (Pre-LayerNorm)
+        # Attention path (Pre-RMSNorm)
         residual = x
-        h = self.ln1(x)
-        attn_output, updated_cache = self.attention(h, mask=mask, cache=cache)
+        h = self.attention_norm(x)
+        attn_output, updated_cache = self.attention(h, mask=mask, cache=cache, rope=rope, offset=offset)
         h = residual + attn_output
 
         # Feed-forward path (Pre-LayerNorm)
         residual = h
-        h_norm = self.ln2(h)
-        ffn_output = self.ffn(h_norm)
+        h_norm = self.ffn_norm(h)
+        ffn_output = self.feed_forward(h_norm)
         out = residual + ffn_output
 
         return out, updated_cache
 
 class Transformer(nn.Module):
-    # Transformer model for language modelling
-
-    def __init__(self, vocab_size: int, num_layers: int, dims: int, num_heads: int, mlp_dims: Optional[int] = None):
+    def __init__(self, config: Dict):
         """
-        vocab_size (int): Size of the vocabulary.
-        num_layers (int): Number of transformer layers.
-        dims (int): Feature dimensions of the input.
-        num_heads (int): Number of attention heads.
-        mlp_dims (int): Hidden dimensions of the feed-forward network.
+        Args:
+            config (Dict): Model configuration dictionary containing parameters like:
+                           vocab_size, hidden_size, num_hidden_layers, num_attention_heads,
+                           num_key_value_heads, hidden_dim (for FFN), rms_norm_eps, rope_theta (base)
+
         """
         super().__init__()
-        self.vocab_size = vocab_size
-        self.num_layers = num_layers
-        self.dims = dims
+        self.vocab_size = config["vocab_size"]
+        self.num_hidden_layers = config["num_hidden_layers"]
+        dims = config["hidden_size"]
+        num_heads = config["num_attention_heads"]
+        num_kv_heads = config["num_key_value_heads"]
+        mlp_dims = config["intermediate_size"]  # FFN hidden data
+        norm_eps = config["rms_norm_eps"]
+        rope_base = config.get("rope_theta", 10000.0)  # Default RoPE base if not in config
 
-        if mlp_dims is None:
-            mlp_dims = dims * 4
+        self.tok_embeddings = nn.Embedding(self.vocab_size, dims)
 
-        self.embedding = nn.Embedding(vocab_size, dims)
+        # RoPE Embeddings (shared across layers) assuming head_dim = dims // num_heads
+        head_dim = dims // num_heads
+        self.rope = RoPE(head_dim, traditional=False, base=rope_base)
 
         self.layers = [
-            TransformerBlock(dims=dims, num_heads=num_heads, mlp_dimms=mlp_dims)
-            for _ in range(num_layers)
+            TransformerBlock(
+                dims=dims,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                mlp_dims=mlp_dims,
+                norm_eps=norm_eps
+            )
+            for _ in range(self.num_hidden_layers)
         ]
 
-        self.ln_f = nn.LayerNorm(dims)
+        # Mistral naming: norm
+        self.norm = nn.RMSNorm(dims, eps=norm_eps)
 
-        self.lm_head = nn.Linear(dims, vocab_size, bias=False)
+        # Mistral naming: output
+        self.output = nn.Linear(dims, self.vocab_size, bias=False)
 
     def __call__(self,
                  inputs: mx.array,
@@ -195,7 +291,12 @@ class Transformer(nn.Module):
             - List of updated KV caches for all layers.
         """
 
-        h = self.embedding(inputs)  # (batch_size, seq_len, dims)
+        h = self.embedding(inputs)
+
+        # Determine sequence offset for RoPE
+        offset = 0
+        if past_kv_caches is not None and past_kv_caches[0] is not None:
+            offset = past_kv_caches[0][0].shape[2]
 
         if past_kv_caches is None:
             past_kv_caches = [None] * self.num_layers
@@ -207,62 +308,26 @@ class Transformer(nn.Module):
         
         new_kv_caches = []
 
+        new_kv_caches = []
         for i, layer in enumerate(self.layers):
-            h, updated_cache = layer(h, mask=mask, cache=past_kv_caches[i])
+            h, updated_cache = layer(
+                h,
+                mask=mask,
+                cache=past_kv_caches[i],
+                rope=self.rope,
+                offset=offset
+            )
             new_kv_caches.append(updated_cache)
 
         h = self.ln_f(h)
-
         logits = self.lm_head(h)
 
         return logits, new_kv_caches
 
-  
-# Example placeholder
-if __name__ == '__main__':
-    # Example config
-    batch_size = 2
-    prompt_len = 5
-    vocab_size = 1000
-    num_layers = 4
-    dims = 128
-    num_heads = 4
-    mlp_dims = dims * 4
-
-    # Create Transformer model
-    model = Transformer(
-        vocab_size=vocab_size,
-        num_layers=num_layers,
-        dims=dims,
-        num_heads=num_heads,
-        mlp_dims=mlp_dims
-    )
-
-    attention_layer = Attention(dims, num_heads)
-
-    # Dummy prompt
-    dummy_inputs = mx.random.randint(0, vocab_size, (batch_size, prompt_len))
-    print(f"dummy_inputs shape: {dummy_inputs.shape}")
-
-    print("Testing without cache...")
-    logits_no_cache, caches_first_pass = model(dummy_inputs, past_kv_caches=None)
-    print(f"Logits shape (no cache): {logits_no_cache.shape}")
-    print(f"Number of caches returned: {len(caches_first_pass)}")
-    if caches_first_pass:
-        print(f"Shape of K cache from first layer (first pass): {caches_first_pass[0][0].shape}")
-
-
-    print("Testing with cache...")
-    next_token_input = mx.random.randint(0, vocab_size, (batch_size, 1))
-    print(f"Next token input shape: {next_token_input.shape}")
-
-    # Pass the list of caches obtained from the first pass
-    logits_with_cache, caches_second_pass = model(next_token_input, past_kv_caches=caches_first_pass)
-    print(f"Logits shape (with cache): {logits_with_cache.shape}") # (batch, 1, vocab_size)
-    print(f"Number of caches returned (second pass): {len(caches_second_pass)}")
-    if caches_second_pass:
-        expected_cache_len = prompt_len + 1
-        print(f"Shape of K cache from first layer (second pass): {caches_second_pass[0][0].shape}")
-        assert caches_second_pass[0][0].shape[2] == expected_cache_len, "Cache length mismatch in second pass!"
-
-    print("All tests passed!")
+    @property
+    def layers(self):
+        return self._layers
+    
+    @layers.setter
+    def layers(self, value):
+        self._layers = value

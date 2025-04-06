@@ -26,7 +26,7 @@ def batch_generate(
         max_new_tokens: int,
         temperature: float = 0.0,  # 0.0 for greedy sampling
         eos_token_id: int = EOS_TOKEN_ID,
-) -> List[List[int]]:
+    ) -> List[List[int]]:
     """
     Generates token sequences for a batch of prompts using KV caching.
     
