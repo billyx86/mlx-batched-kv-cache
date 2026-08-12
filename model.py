@@ -76,12 +76,15 @@ class Attention(nn.Module):
 
         if cache is not None:
             key_cache, value_cache = cache
+            # Ensure cache shapes match for concatenation
             keys = mx.concatenate([key_cache, keys], axis=2)
             values = mx.concatenate([value_cache, values], axis=2)
 
+        # Cache the full sequence for next iteration
         updated_key_cache = keys
         updated_value_cache = values
 
+        # GQA: repeat KV heads to match query heads
         if self.num_kv_heads < self.num_heads:
             num_repeats = self.num_heads // self.num_kv_heads
             keys = mx.repeat(keys, repeats=num_repeats, axis=1)
