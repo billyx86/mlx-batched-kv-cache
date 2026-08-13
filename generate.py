@@ -134,9 +134,7 @@ def generate_stream(
     start_time = time.time()
 
     # Process the prompt to initialize KV caches
-    _, kv_caches = model(prompt_ids, past_kv_caches=None)
-    current_token = prompt_ids[:, -1:]
-    logits, kv_caches = model(current_token, past_kv_caches=kv_caches)
+    logits, kv_caches = model(prompt_ids, past_kv_caches=None)
 
     prompt_time = time.time() - start_time
     print(f"Prompt processing time: {prompt_time:.4f} seconds")
