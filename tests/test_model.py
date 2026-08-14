@@ -125,6 +125,31 @@ def test_kv_cache_matches_full_sequence():
     assert mx.allclose(logits_full[:, -1], logits_cached, atol=1e-3).item()
 
 
+def test_gqa_matches_repeat_reference():
+    """Broadcast GQA must produce the same output as materializing repeated KV heads."""
+    mx.random.seed(0)
+    dims, num_heads, num_kv_heads, seq_len = 128, 4, 2, 5
+    attn = Attention(dims, num_heads, num_kv_heads, 64, 4, 64, 4, 64, 4)
+    rope = RoPE(dims // num_heads, traditional=True)
+    x = mx.random.normal((1, seq_len, dims))
+
+    out, _ = attn(x, rope=rope)
+
+    # Reference implementation using mx.repeat
+    head_dim = dims // num_heads
+    q = attn.q_proj(x).reshape(1, seq_len, num_heads, head_dim).transpose(0, 2, 1, 3)
+    k = attn.k_proj(x).reshape(1, seq_len, num_kv_heads, head_dim).transpose(0, 2, 1, 3)
+    v = attn.v_proj(x).reshape(1, seq_len, num_kv_heads, head_dim).transpose(0, 2, 1, 3)
+    q, k = rope(q), rope(k)
+    k = mx.repeat(k, num_heads // num_kv_heads, axis=1)
+    v = mx.repeat(v, num_heads // num_kv_heads, axis=1)
+    scores = (q @ k.transpose(0, 1, 3, 2)) * attn.scale
+    weights = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
+    ref = attn.o_proj((weights @ v).transpose(0, 2, 1, 3).reshape(1, seq_len, -1))
+
+    assert mx.allclose(out, ref, atol=1e-4).item()
+
+
 def test_gqa_forward():
     """Forward pass with num_kv_heads < num_heads (grouped query attention)."""
     mx.random.seed(0)
