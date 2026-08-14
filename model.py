@@ -18,10 +18,9 @@ def make_causal_mask(seq_len: int) -> mx.array:
 
 
 class RoPE(nn.Module):
-    def __init__(self, dims: int, traditional: bool = False, base: float = 10000.0):
+    def __init__(self, dims: int, base: float = 10000.0):
         super().__init__()
         self.dims = dims
-        self.traditional = traditional
         self.base = base
         self._compute_inv_freq()
 
@@ -37,34 +36,25 @@ class RoPE(nn.Module):
         cos_emb = mx.cos(emb)
         sin_emb = mx.sin(emb)
 
-        if self.traditional:
-            x1 = x[..., : self.dims // 2]
-            x2 = x[..., self.dims // 2 :]
-            rotated_x = mx.concatenate([-x2, x1], axis=-1)
-            return (x * cos_emb) + (rotated_x * sin_emb)
-        else:
-             # Simplified non-traditional RoPE application using complex numbers
-            x_complex = mx.view_as_complex(x.astype(mx.float32).reshape(*x.shape[:-1], -1, 2))
-            emb_complex = mx.view_as_complex(emb.astype(mx.float32).reshape(*emb.shape[:-1], -1, 2))
-            emb_complex = mx.exp(1j * emb_complex) # exp(i * theta) = cos(theta) + i * sin(theta)
-            rotated_x_complex = x_complex * emb_complex
-            rotated_x = mx.view_as_real(rotated_x_complex).reshape(*x.shape[:-1], -1)
-            return rotated_x.astype(x.dtype)
+        x1 = x[..., : self.dims // 2]
+        x2 = x[..., self.dims // 2 :]
+        rotated_x = mx.concatenate([-x2, x1], axis=-1)
+        return (x * cos_emb) + (rotated_x * sin_emb)
 
 
 class Attention(nn.Module):
-    """ Renamed internal layers to q_proj, k_proj, v_proj, o_proj """
-    def __init__(self, dims: int, num_heads: int, num_kv_heads: int, qk_proj_group_size: int, qk_proj_bits: int, v_proj_group_size: int, v_proj_bits: int, o_proj_group_size: int, o_proj_bits: int):
+    """ Attention with quantized projections and grouped query attention. """
+    def __init__(self, dims: int, num_heads: int, num_kv_heads: int, group_size: int, bits: int):
         super().__init__()
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dims // num_heads
         self.scale = self.head_dim ** -0.5
 
-        self.q_proj = QuantizedLinear(dims, num_heads * self.head_dim, group_size=qk_proj_group_size, bits=qk_proj_bits, bias=False)
-        self.k_proj = QuantizedLinear(dims, num_kv_heads * self.head_dim, group_size=qk_proj_group_size, bits=qk_proj_bits, bias=False)
-        self.v_proj = QuantizedLinear(dims, num_kv_heads * self.head_dim, group_size=v_proj_group_size, bits=v_proj_bits, bias=False)
-        self.o_proj = QuantizedLinear(num_heads * self.head_dim, dims, group_size=o_proj_group_size, bits=o_proj_bits, bias=False)
+        self.q_proj = QuantizedLinear(dims, num_heads * self.head_dim, group_size=group_size, bits=bits, bias=False)
+        self.k_proj = QuantizedLinear(dims, num_kv_heads * self.head_dim, group_size=group_size, bits=bits, bias=False)
+        self.v_proj = QuantizedLinear(dims, num_kv_heads * self.head_dim, group_size=group_size, bits=bits, bias=False)
+        self.o_proj = QuantizedLinear(num_heads * self.head_dim, dims, group_size=group_size, bits=bits, bias=False)
 
     def __call__(self,
                  x: mx.array,
@@ -150,31 +140,11 @@ class TransformerBlock(nn.Module):
         if global_group_size is None or global_bits is None:
              raise ValueError("Global 'group_size' and 'bits' not found in quantization config.")
 
-        # Use global settings for all quantized layers in the block
-        attn_qk_group_size = global_group_size
-        attn_qk_bits = global_bits
-        attn_v_group_size = global_group_size
-        attn_v_bits = global_bits
-        attn_o_group_size = global_group_size
-        attn_o_bits = global_bits
-        mlp_group_size = global_group_size
-        mlp_bits = global_bits
-
         self.input_layernorm = nn.RMSNorm(dims, eps=norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(dims, eps=norm_eps)
 
-        self.self_attn = Attention(
-             dims, num_heads, num_kv_heads,
-             attn_qk_group_size, attn_qk_bits,
-             attn_v_group_size, attn_v_bits,
-             attn_o_group_size, attn_o_bits
-        )
-        self.mlp = MLP(dims=dims, hidden_dims=mlp_dims, group_size=mlp_group_size, bits=mlp_bits)
-
-        # Debug print for quantization config used
-        # print(f"Block Quant Config: attn_qk={attn_qk_bits}bit/{attn_qk_group_size}g, "
-        #       f"attn_v={attn_v_bits}bit/{attn_v_group_size}g, attn_o={attn_o_bits}bit/{attn_o_group_size}g, "
-        #       f"mlp={mlp_bits}bit/{mlp_group_size}g")
+        self.self_attn = Attention(dims, num_heads, num_kv_heads, global_group_size, global_bits)
+        self.mlp = MLP(dims=dims, hidden_dims=mlp_dims, group_size=global_group_size, bits=global_bits)
 
     def __call__(self,
                  x: mx.array,
@@ -211,7 +181,7 @@ class Transformer(nn.Module):
 
         self.embed_tokens = nn.Embedding(self.vocab_size, dims)
 
-        self.rope = RoPE(head_dim, traditional=True, base=rope_base) # Use traditional RoPE
+        self.rope = RoPE(head_dim, base=rope_base)
 
         # Ensure TransformerBlock receives the config dict
         self.layers = [

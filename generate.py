@@ -2,6 +2,7 @@ import mlx.core as mx
 import time
 import argparse
 import os
+import sys
 import json
 from typing import List, Tuple, Dict, Generator
 from transformers import AutoTokenizer
@@ -102,6 +103,7 @@ def generate_stream(
         prompt: str,
         max_new_tokens: int,
         temperature: float = 0.0,
+        verbose: bool = False,
 ) -> Generator[str, None, None]:
     """
     Generates text token by token for a single prompt using KV caching.
@@ -145,7 +147,7 @@ def generate_stream(
     loop_start_time = time.time()
 
     for i in range(max_new_tokens):
-        step_start_time = time.time()
+        step_start_time = time.time() if verbose else 0.0
 
         if temperature == 0.0:
             next_token = greedy_sample(logits)
@@ -171,8 +173,9 @@ def generate_stream(
         logits, kv_caches = model(current_token, past_kv_caches=kv_caches)
         mx.eval(logits, kv_caches) # Evaluate for the next step
 
-        step_time = time.time() - step_start_time
-        print(f"\nStep {i + 1}/{max_new_tokens} completed in {step_time:.4f} seconds.\n\n")
+        if verbose:
+            step_time = time.time() - step_start_time
+            print(f"\nStep {i + 1}/{max_new_tokens} completed in {step_time:.4f} seconds.\n\n")
     
     loop_time = time.time() - loop_start_time
     total_gen_tokens = len(generated_token_ids)
@@ -188,6 +191,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-tokens", type=int, default=100, help="Maximum number of new tokens to generate.")
     parser.add_argument("--temp", type=float, default=0.0, help="Sampling temperature (0.0 for greedy).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
+    parser.add_argument("--verbose", action="store_true", help="Print per-step timing info.")
 
     args = parser.parse_args()
 
@@ -197,7 +201,7 @@ if __name__ == "__main__":
         model, tokenizer, config = load_model(args.model_path)
     except Exception as e:
         print(f"Error loading model: {e}")
-        exit(1)
+        sys.exit(1)
     
     print((f"\nPrompt: {args.prompt}"))
 
@@ -208,7 +212,8 @@ if __name__ == "__main__":
             tokenizer=tokenizer,
             prompt=args.prompt,
             max_new_tokens=args.max_tokens,
-            temperature=args.temp
+            temperature=args.temp,
+            verbose=args.verbose
     ):
         print(text_delta, end="", flush=True)
         full_response += text_delta

@@ -10,7 +10,7 @@ This project implements a transformer model with batched key-value caching for e
 
 - Batched KV cache for efficient generation
 - Quantized linear layers via `mlx.nn.QuantizedLinear`
-- RoPE positional embeddings (traditional and complex)
+- RoPE positional embeddings
 - Streaming text generation with `generate_stream`
 - Support for Mistral-compatible models
 
@@ -72,7 +72,7 @@ Main model class. See `model.py` for architecture details.
 
 Loads MLX model, tokenizer, and config.
 
-### `generate_stream(model, tokenizer, prompt, max_new_tokens, temperature)`
+### `generate_stream(model, tokenizer, prompt, max_new_tokens, temperature, verbose=False)`
 
 Yields text deltas token by token.
 
