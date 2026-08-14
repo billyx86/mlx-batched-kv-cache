@@ -141,7 +141,6 @@ def generate_stream(
 
     # Generation Loop Phase
     generated_token_ids = []
-    current_decoded_text = ""
     print("Generating tokens...")
     loop_start_time = time.time()
 
@@ -160,17 +159,12 @@ def generate_stream(
             print(f"\nEnd of sequence token encountered at step {i}.")
             break
             
-        # Decode the newly generated token only to yield delta
-        # This might produce partial unicode sequences, handle carefully
-        # Attempting to decode incrementally
-        current_sequence = generated_token_ids
-        # Use skip_special_tokens=True to avoid printing EOS
-        new_decoded_text = tokenizer.decode(current_sequence, skip_special_tokens=True)
-
-        # Calculate and yield the delta
-        text_delta = new_decoded_text[len(current_decoded_text):]
-        current_decoded_text = new_decoded_text # Update the full decoded text
-        yield text_delta # Yield the newly generated chunk
+        # Decode only the new token (O(1) per step instead of re-decoding the
+        # whole sequence). Consecutive per-token decodes concatenate to the
+        # same text as a single full decode.
+        text_delta = tokenizer.decode([token_id], skip_special_tokens=True)
+        if text_delta:
+            yield text_delta
 
         # Prepare for next iteration
         current_token = next_token.reshape((1, 1))  # Reshape for the model input

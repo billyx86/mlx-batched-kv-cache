@@ -95,17 +95,23 @@ class Attention(nn.Module):
         updated_key_cache = keys
         updated_value_cache = values
 
-        # GQA: repeat KV heads to match query heads
-        if self.num_kv_heads < self.num_heads:
-            num_repeats = self.num_heads // self.num_kv_heads
-            keys = mx.repeat(keys, repeats=num_repeats, axis=1)
-            values = mx.repeat(values, repeats=num_repeats, axis=1)
+        # GQA without materializing repeated KV heads: group the query heads
+        # that share each KV head and let the matmul broadcast over the group.
+        # queries: (B, H, T, D) -> (B, KV, G, T, D); keys/values stay (B, KV, ...)
+        num_repeats = self.num_heads // self.num_kv_heads
+        queries = queries.reshape(batch_size, self.num_kv_heads, num_repeats, seq_len, self.head_dim)
 
-        scores = (queries @ keys.transpose(0, 1, 3, 2)) * self.scale
+        # Expand keys to 5 dims so the matmul broadcasts over the group axis
+        keys_t = keys[:, :, None].transpose(0, 1, 2, 4, 3)  # (B, KV, 1, D, T_k)
+        scores = (queries @ keys_t) * self.scale  # (B, KV, G, T, T_k)
         if mask is not None: scores = scores + mask
         attention_weights = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
-        attention_output = attention_weights @ values
-        output_concat = attention_output.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, -1)
+        # Broadcast values over the group axis: (B, KV, 1, T_k, D)
+        attention_output = attention_weights @ values[:, :, None]
+
+        # (B, KV, G, T, D) -> (B, T, H, D) with head order h = kv * G + g
+        attention_output = attention_output.transpose(0, 3, 1, 2, 4).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        output_concat = attention_output.reshape(batch_size, seq_len, -1)
 
         output = self.o_proj(output_concat)
 
