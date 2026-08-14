@@ -6,6 +6,17 @@ from typing import Optional, Tuple, List, Dict
 from mlx.nn import QuantizedLinear
 
 
+def make_causal_mask(seq_len: int) -> mx.array:
+    """Build a causal (lower-triangular) attention mask of shape (1, 1, T, T).
+
+    Positions above the diagonal are masked with -inf so that, after
+    addition to the attention scores, they contribute zero probability.
+    """
+    positions = mx.arange(seq_len)
+    mask = positions[None, :] > positions[:, None]  # True where attention is disallowed
+    return mx.where(mask, float("-inf"), 0.0).reshape(1, 1, seq_len, seq_len)
+
+
 class RoPE(nn.Module):
     def __init__(self, dims: int, traditional: bool = False, base: float = 10000.0):
         super().__init__()
@@ -50,10 +61,10 @@ class Attention(nn.Module):
         self.head_dim = dims // num_heads
         self.scale = self.head_dim ** -0.5
 
-        self.q_proj = QuantizedLinear(dims, num_heads * self.head_dim, group_size=qk_proj_group_size, bits=qk_proj_bits, bias=True)
-        self.k_proj = QuantizedLinear(dims, num_kv_heads * self.head_dim, group_size=qk_proj_group_size, bits=qk_proj_bits, bias=True)
-        self.v_proj = QuantizedLinear(dims, num_kv_heads * self.head_dim, group_size=v_proj_group_size, bits=v_proj_bits, bias=True)
-        self.o_proj = QuantizedLinear(num_heads * self.head_dim, dims, group_size=o_proj_group_size, bits=o_proj_bits, bias=True)
+        self.q_proj = QuantizedLinear(dims, num_heads * self.head_dim, group_size=qk_proj_group_size, bits=qk_proj_bits, bias=False)
+        self.k_proj = QuantizedLinear(dims, num_kv_heads * self.head_dim, group_size=qk_proj_group_size, bits=qk_proj_bits, bias=False)
+        self.v_proj = QuantizedLinear(dims, num_kv_heads * self.head_dim, group_size=v_proj_group_size, bits=v_proj_bits, bias=False)
+        self.o_proj = QuantizedLinear(num_heads * self.head_dim, dims, group_size=o_proj_group_size, bits=o_proj_bits, bias=False)
 
     def __call__(self,
                  x: mx.array,
@@ -105,9 +116,9 @@ class MLP(nn.Module):
     """ MLP layer. """
     def __init__(self, dims: int, hidden_dims: int, group_size: int, bits: int):
         super().__init__()
-        self.gate_proj = QuantizedLinear(dims, hidden_dims, group_size=group_size, bits=bits, bias=True)
-        self.down_proj = QuantizedLinear(hidden_dims, dims, group_size=group_size, bits=bits, bias=True)
-        self.up_proj = QuantizedLinear(dims, hidden_dims, group_size=group_size, bits=bits, bias=True)
+        self.gate_proj = QuantizedLinear(dims, hidden_dims, group_size=group_size, bits=bits, bias=False)
+        self.down_proj = QuantizedLinear(hidden_dims, dims, group_size=group_size, bits=bits, bias=False)
+        self.up_proj = QuantizedLinear(dims, hidden_dims, group_size=group_size, bits=bits, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -210,7 +221,7 @@ class Transformer(nn.Module):
             global_bits = quant_config.get("bits")
             if global_group_size is None or global_bits is None:
                  raise ValueError("Global 'group_size' and 'bits' not found in quantization config for lm_head.")
-            self.lm_head = QuantizedLinear(dims, self.vocab_size, group_size=global_group_size, bits=global_bits, bias=True)
+            self.lm_head = QuantizedLinear(dims, self.vocab_size, group_size=global_group_size, bits=global_bits, bias=False)
         else:
              self.lm_head = nn.Linear(dims, self.vocab_size, bias=False)
 
@@ -226,17 +237,19 @@ class Transformer(nn.Module):
         if past_kv_caches is not None and past_kv_caches[0] is not None:
             offset = past_kv_caches[0][0].shape[2]
 
+        # Prefill (no cache yet): apply a causal mask so no position attends
+        # to future positions. Decode steps (cache present, seq_len == 1)
+        # need no mask because the cache is already causal.
+        if mask is None and (past_kv_caches is None or past_kv_caches[0] is None) and inputs.shape[1] > 1:
+            mask = make_causal_mask(inputs.shape[1])
+
         if past_kv_caches is None: past_kv_caches = [None] * self.num_hidden_layers
         if len(past_kv_caches) != self.num_hidden_layers:
              raise ValueError(f"Incorrect num caches. Expected {self.num_hidden_layers}, got {len(past_kv_caches)}")
 
         new_kv_caches = []
         for i, layer in enumerate(self.layers):
-            try:
-                h, updated_cache = layer(h, mask=mask, cache=past_kv_caches[i], rope=self.rope, offset=offset)
-            except Exception as e:
-                print(f"Error in layer {i}: {e}")
-                raise e
+            h, updated_cache = layer(h, mask=mask, cache=past_kv_caches[i], rope=self.rope, offset=offset)
             new_kv_caches.append(updated_cache)
 
         h = self.norm(h)
