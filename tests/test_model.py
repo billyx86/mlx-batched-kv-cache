@@ -26,17 +26,7 @@ def test_rope_initialization():
 
 
 def test_attention_initialization():
-    attn = Attention(
-        dims=256,
-        num_heads=4,
-        num_kv_heads=2,
-        qk_proj_group_size=64,
-        qk_proj_bits=4,
-        v_proj_group_size=64,
-        v_proj_bits=4,
-        o_proj_group_size=64,
-        o_proj_bits=4
-    )
+    attn = Attention(dims=256, num_heads=4, num_kv_heads=2, group_size=64, bits=4)
     assert attn.num_heads == 4
     assert attn.num_kv_heads == 2
     assert attn.head_dim == 64
@@ -129,8 +119,8 @@ def test_gqa_matches_repeat_reference():
     """Broadcast GQA must produce the same output as materializing repeated KV heads."""
     mx.random.seed(0)
     dims, num_heads, num_kv_heads, seq_len = 128, 4, 2, 5
-    attn = Attention(dims, num_heads, num_kv_heads, 64, 4, 64, 4, 64, 4)
-    rope = RoPE(dims // num_heads, traditional=True)
+    attn = Attention(dims, num_heads, num_kv_heads, group_size=64, bits=4)
+    rope = RoPE(dims // num_heads)
     x = mx.random.normal((1, seq_len, dims))
 
     out, _ = attn(x, rope=rope)
