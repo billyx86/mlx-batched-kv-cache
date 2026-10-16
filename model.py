@@ -17,6 +17,32 @@ def make_causal_mask(seq_len: int) -> mx.array:
     return mx.where(mask, float("-inf"), 0.0).reshape(1, 1, seq_len, seq_len)
 
 
+def make_causal_mask_with_prefix(new_len: int, past_len: int) -> mx.array:
+    """Build a causal mask for a chunk of input that follows an existing KV cache.
+
+    Used for chunked prefill: the model has already cached ``past_len``
+    tokens and is now processing ``new_len`` more. The attention scores have
+    shape ``(..., new_len, new_len + past_len)`` — the last axis spans the
+    *full* context (cached prefix + new chunk) — so a plain
+    ``make_causal_mask(new_len)`` of shape ``(..., new_len, new_len)`` cannot
+    be broadcast onto it.
+
+    The mask is ``(1, 1, new_len, new_len + past_len)``. A new-chunk row at
+    index ``i`` corresponds to absolute position ``past_len + i``; it may
+    attend to any context column ``j`` with ``j <= past_len + i``. That means
+    the first ``past_len`` columns (the cached prefix) are always allowed,
+    and the trailing ``new_len`` columns form the usual lower-triangular
+    causal block for the new chunk.
+
+    With ``past_len == 0`` this is identical to ``make_causal_mask(new_len)``.
+    """
+    total = new_len + past_len
+    row_abs = past_len + mx.arange(new_len)       # (new_len,) absolute row positions
+    col_abs = mx.arange(total)                    # (total,) absolute column positions
+    disallowed = col_abs[None, :] > row_abs[:, None]  # (new_len, total) True = masked
+    return mx.where(disallowed, float("-inf"), 0.0).reshape(1, 1, new_len, total)
+
+
 class RoPE(nn.Module):
     def __init__(self, dims: int, base: float = 10000.0):
         super().__init__()
@@ -214,10 +240,17 @@ class Transformer(nn.Module):
             offset = past_kv_caches[0][0].shape[2]
 
         # Prefill (no cache yet): apply a causal mask so no position attends
-        # to future positions. Decode steps (cache present, seq_len == 1)
-        # need no mask because the cache is already causal.
-        if mask is None and (past_kv_caches is None or past_kv_caches[0] is None) and inputs.shape[1] > 1:
-            mask = make_causal_mask(inputs.shape[1])
+        # to future positions. A single-token decode step (cache present,
+        # seq_len == 1) needs no mask because the cache is already causal.
+        # A *chunked* prefill (cache present, seq_len > 1) needs a
+        # (T, T + past_len) mask: the cached prefix is always in the past,
+        # and the new chunk must be causal within itself (issue #13).
+        if mask is None and inputs.shape[1] > 1:
+            if past_kv_caches is None or past_kv_caches[0] is None:
+                mask = make_causal_mask(inputs.shape[1])
+            else:
+                # offset == cached prefix length (set above when a cache exists)
+                mask = make_causal_mask_with_prefix(inputs.shape[1], offset)
 
         if past_kv_caches is None: past_kv_caches = [None] * self.num_hidden_layers
         if len(past_kv_caches) != self.num_hidden_layers:

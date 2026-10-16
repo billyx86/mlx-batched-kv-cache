@@ -3,7 +3,15 @@ Unit tests for mlx-batched-kv-cache model components.
 """
 import pytest
 import mlx.core as mx
-from model import RoPE, Attention, MLP, TransformerBlock, Transformer, make_causal_mask
+from model import (
+    RoPE,
+    Attention,
+    MLP,
+    TransformerBlock,
+    Transformer,
+    make_causal_mask,
+    make_causal_mask_with_prefix,
+)
 
 
 def make_test_config(num_kv_heads=2):
@@ -153,3 +161,99 @@ def test_gqa_forward():
     k, v = caches[0]
     assert k.shape[1] == 1
     assert v.shape[1] == 1
+
+
+class TestCausalMaskWithPrefix:
+    """make_causal_mask_with_prefix: the chunked-prefill mask (issue #13)."""
+
+    def test_shape_is_new_by_total(self):
+        for new_len, past_len in [(3, 4), (1, 1), (5, 0), (2, 7)]:
+            mask = make_causal_mask_with_prefix(new_len, past_len)
+            assert mask.shape == (1, 1, new_len, new_len + past_len)
+
+    def test_zero_prefix_equals_plain_causal(self):
+        for T in (1, 2, 3, 5):
+            m = make_causal_mask_with_prefix(T, 0)
+            p = make_causal_mask(T)
+            assert mx.allclose(m, p).item()
+
+    def test_pattern_allows_past_blocks_future(self):
+        new_len, past_len = 3, 4
+        mask = make_causal_mask_with_prefix(new_len, past_len)
+        m = mask[0, 0]  # (new_len, new_len + past_len)
+        for i in range(new_len):
+            abs_pos = past_len + i
+            for col in range(new_len + past_len):
+                if col <= abs_pos:
+                    assert m[i, col].item() == 0.0, (i, col)
+                else:
+                    assert m[i, col].item() == float("-inf"), (i, col)
+
+    def test_cached_prefix_columns_always_allowed(self):
+        mask = make_causal_mask_with_prefix(5, 6)
+        prefix = mask[0, 0, :, :6]
+        assert mx.all(prefix == 0.0).item()
+
+
+class TestChunkedPrefill:
+    """A chunked prefill through the public API must match a full forward pass.
+
+    Before issue #13 was fixed, passing a multi-token input together with an
+    existing cache applied *no* mask, so the new chunk attended to its own
+    future — a causality violation. These tests pin the corrected behavior.
+    """
+
+    def test_chunked_prefill_matches_full_forward(self):
+        """Process [1,2] then [3,4,5,6] via the cache == process all at once."""
+        mx.random.seed(0)
+        model = Transformer(make_test_config())
+        mx.eval(model.parameters())
+
+        seq = mx.array([[1, 2, 3, 4, 5, 6]])
+        logits_full, _ = model(seq)
+
+        # Chunk 1: prefill the first two tokens (no cache yet).
+        _, caches = model(seq[:, :2])
+        # Chunk 2: the remaining four tokens against the existing cache.
+        logits_chunked, _ = model(seq[:, 2:], past_kv_caches=caches)
+        mx.eval(logits_full, logits_chunked)
+
+        # Chunk 2's per-position logits must equal the corresponding rows of
+        # the full prefill (positions 2..5).
+        assert mx.allclose(logits_chunked, logits_full[:, 2:], atol=1e-3).item()
+
+    def test_chunked_single_token_decode_still_matches(self):
+        """The plain per-token decode path must be unaffected by the fix."""
+        mx.random.seed(0)
+        model = Transformer(make_test_config())
+        mx.eval(model.parameters())
+
+        seq = mx.array([[1, 2, 3, 4, 5]])
+        logits_full, _ = model(seq)
+
+        _, caches = model(seq[:, :1])
+        for t in range(1, seq.shape[1]):
+            logits_step, caches = model(seq[:, t:t + 1], past_kv_caches=caches)
+        mx.eval(logits_full, logits_step)
+
+        assert mx.allclose(logits_full[:, -1], logits_step, atol=1e-3).item()
+
+    def test_chunked_prefill_first_token_is_causal(self):
+        """The first token of a new chunk must NOT see the chunk's later tokens.
+
+        Position 0 of chunk 2 (absolute position 2) depends only on tokens
+        [1, 2] — not on [3, 4, 5, 6] that are present in the same chunk.
+        """
+        mx.random.seed(0)
+        model = Transformer(make_test_config())
+        mx.eval(model.parameters())
+
+        # logits for absolute position 2 when processed as part of chunk 2.
+        _, caches = model(mx.array([[1, 2]]))
+        logits_chunked, _ = model(mx.array([[3, 4, 5, 6]]), past_kv_caches=caches)
+
+        # logits for absolute position 2 when [1,2,3] is prefilled whole.
+        logits_ref, _ = model(mx.array([[1, 2, 3]]))
+        mx.eval(logits_chunked, logits_ref)
+
+        assert mx.allclose(logits_chunked[:, 0], logits_ref[:, 2], atol=1e-4).item()
