@@ -48,3 +48,47 @@ class TestNormalizeWeightKeys:
         value = mx.zeros((3, 3))
         out = normalize_weight_keys({"model.x": value})
         assert out["x"] is value
+
+
+class TestNextTokenSlicing:
+    """The prefill->decode token extraction in generate_stream (issue #12).
+
+    ``generate_stream`` predicts the next token with
+    ``greedy_sample(logits[:, -1, :])``. Before the fix it called
+    ``greedy_sample(logits)`` on the raw prefill logits of shape
+    ``(batch, seq_len, vocab)`` and then ``.item()``-ed the result — which
+    has ``seq_len`` elements and raised ``ValueError`` for any prompt longer
+    than one token. These tests pin the corrected mechanism on synthetic
+    tensors so no downloaded model is required.
+    """
+
+    def _extract(self, logits):
+        # Mirror the body of the generation loop after the #12 fix.
+        next_token = mx.argmax(logits[:, -1, :], axis=-1)
+        token_id = next_token.item()  # must be a single scalar
+        current_token = next_token.reshape((1, 1))
+        return token_id, current_token
+
+    def test_prefill_multi_token_does_not_raise(self):
+        # Prefill logits: (batch=1, seq_len=4, vocab=8). Old code raised here.
+        mx.random.seed(0)
+        logits = mx.random.normal((1, 4, 8))
+        token_id, current_token = self._extract(logits)
+        assert isinstance(token_id, int)
+        assert 0 <= token_id < 8
+        assert current_token.shape == (1, 1)
+
+    def test_prefill_token_is_last_position_argmax(self):
+        mx.random.seed(1)
+        logits = mx.random.normal((1, 5, 10))
+        token_id, _ = self._extract(logits)
+        expected = int(mx.argmax(logits[:, -1, :], axis=-1).item())
+        assert token_id == expected
+
+    def test_decode_step_single_token(self):
+        # Decode step returns (batch=1, seq_len=1, vocab=V) — must still work.
+        mx.random.seed(2)
+        logits = mx.random.normal((1, 1, 6))
+        token_id, current_token = self._extract(logits)
+        assert isinstance(token_id, int)
+        assert current_token.shape == (1, 1)

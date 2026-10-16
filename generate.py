@@ -172,10 +172,15 @@ def generate_stream(
     for i in range(max_new_tokens):
         step_start_time = time.time() if verbose else 0.0
 
+        # Only the final position predicts the next token. After the prompt
+        # prefill `logits` is (batch, seq_len, vocab) — one row per prompt
+        # position — and each decode step returns (batch, 1, vocab)
+        # (issue #12: taking argmax over the whole prefill and then
+        # .item() raised for any prompt longer than one token).
         if temperature == 0.0:
-            next_token = greedy_sample(logits)
+            next_token = greedy_sample(logits[:, -1, :])
         else:
-            next_token = greedy_sample(logits)  # Placeholder for temperature sampling
+            next_token = greedy_sample(logits[:, -1, :])  # Placeholder for temperature sampling
 
         token_id = next_token.item()
         generated_token_ids.append(token_id)
