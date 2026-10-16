@@ -8,6 +8,28 @@ from typing import List, Tuple, Dict, Generator
 from transformers import AutoTokenizer
 from model import Transformer
 
+def normalize_weight_keys(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
+    """
+    Strips a single leading ``model.`` prefix from each weight key.
+
+    HF checkpoints ship their weights under ``model.<...>`` (e.g.
+    ``model.layers.0.self_attn.q_proj.weight``) while this repo's module
+    tree is rooted at the top level (``layers.0...``). Only the leading
+    prefix may be removed: a key such as ``model.model.embed_tokens.weight``
+    must keep its second ``model.`` segment, which a blanket
+    ``str.replace`` would destroy.
+
+    Pure function of the key set (no MLX calls) so it can be unit-tested
+    without a GPU / Apple Silicon.
+
+    Args:
+        weights (Dict[str, mx.array]): Raw weight dict from ``mx.load``.
+
+    Returns:
+        Dict[str, mx.array]: Keys with a single leading ``model.`` removed.
+    """
+    return {k.removeprefix("model."): v for k, v in weights.items()}
+
 def load_model(model_path: str) -> Tuple[Transformer, AutoTokenizer, Dict]:
     """
     Loads the MLX model, tokenizer, and configuration from a specified path.
@@ -61,8 +83,9 @@ def load_model(model_path: str) -> Tuple[Transformer, AutoTokenizer, Dict]:
         print(f"Loading weights from {weights_path}...")
         weights = mx.load(weights_path)
         
-        # Remove 'model.' prefix if present
-        weights = {k.replace("model.", ""): v for k, v in weights.items()}
+        # Remove a leading 'model.' prefix if present (see
+        # normalize_weight_keys for why only the leading one).
+        weights = normalize_weight_keys(weights)
         
         model.update(weights) # Use update with the processed dictionary
         # model.load_weights(weights_path) # Original call replaced
@@ -149,10 +172,15 @@ def generate_stream(
     for i in range(max_new_tokens):
         step_start_time = time.time() if verbose else 0.0
 
+        # Only the final position predicts the next token. After the prompt
+        # prefill `logits` is (batch, seq_len, vocab) — one row per prompt
+        # position — and each decode step returns (batch, 1, vocab)
+        # (issue #12: taking argmax over the whole prefill and then
+        # .item() raised for any prompt longer than one token).
         if temperature == 0.0:
-            next_token = greedy_sample(logits)
+            next_token = greedy_sample(logits[:, -1, :])
         else:
-            next_token = greedy_sample(logits)  # Placeholder for temperature sampling
+            next_token = greedy_sample(logits[:, -1, :])  # Placeholder for temperature sampling
 
         token_id = next_token.item()
         generated_token_ids.append(token_id)

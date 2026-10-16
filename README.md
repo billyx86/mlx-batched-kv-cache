@@ -60,7 +60,22 @@ python generate.py --model-path ./models/Mistral-7B-Instruct-v0.2-mlx \
 - `model.py` - Transformer architecture with KV caching
 - `generate.py` - Model loading and text generation
 - `list_weights.py` - Utility to inspect safetensors weights
-- `tests/` - Unit tests
+- `tests/` - Unit tests (pytest)
+- `benchmark.py` - Quick batch-size throughput benchmark
+
+## Testing
+
+Tests run on macOS ARM runners (MLX requires Apple Silicon):
+
+```bash
+pip install -r requirements.txt pytest
+pytest -q
+```
+
+The suite covers the causal mask (plain and chunked-prefill variants),
+GQA broadcast vs. repeat reference, KV-cache equivalence with a full
+forward pass, weight-key normalization, and the prefill→decode token
+extraction — without needing a downloaded model.
 
 ## API Reference
 
@@ -68,9 +83,35 @@ python generate.py --model-path ./models/Mistral-7B-Instruct-v0.2-mlx \
 
 Main model class. See `model.py` for architecture details.
 
+`__call__` supports three usage patterns:
+
+- **Full prefill** — pass the whole prompt with no cache: a causal mask is
+  applied automatically.
+- **Single-token decode** — pass a `(B, 1)` token with `past_kv_caches` from
+  a previous call: O(1) per step, no mask needed.
+- **Chunked prefill** — pass a multi-token chunk `(B, T)` together with
+  `past_kv_caches` from an earlier chunk (added for issue #13). A
+  `(1, 1, T, T + past_len)` mask is built automatically, so the chunk is
+  causal within itself while freely attending to the cached prefix. This is
+  how to stream long prompts in fixed-size pieces through the public API:
+
+  ```python
+  # Fill the cache with the first chunk.
+  _, caches = model(chunk_1)
+  # Continue with the next chunk — causally correct, no manual mask needed.
+  logits, caches = model(chunk_2, past_kv_caches=caches)
+  ```
+
+### `make_causal_mask(seq_len)` / `make_causal_mask_with_prefix(new_len, past_len)`
+
+Build `(1, 1, T, T)` and `(1, 1, T, T + past_len)` attention masks
+respectively (see `model.py`); the latter exists for chunked prefill.
+
 ### `load_model(model_path)`
 
-Loads MLX model, tokenizer, and config.
+Loads MLX model, tokenizer, and config. Weight keys with a leading
+`model.` prefix (HF-style checkpoints) are normalized automatically;
+inner occurrences of `model.` in a key are preserved.
 
 ### `generate_stream(model, tokenizer, prompt, max_new_tokens, temperature, verbose=False)`
 
