@@ -17,10 +17,11 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
+        # requirements-ci.txt holds exact pins for the gate (#18);
+        # requirements.txt keeps ranges for end users.
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest
+          pip install -r requirements-ci.txt
 
       - name: Run tests
         run: pytest -q

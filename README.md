@@ -59,6 +59,7 @@ python generate.py --model-path ./models/Mistral-7B-Instruct-v0.2-mlx \
 
 - `model.py` - Transformer architecture with KV caching
 - `generate.py` - Model loading and text generation
+- `weights.py` - Checkpoint weight resolution (single-file + sharded) and shard merging
 - `list_weights.py` - Utility to inspect safetensors weights
 - `tests/` - Unit tests (pytest)
 - `benchmark.py` - Quick batch-size throughput benchmark
@@ -113,13 +114,27 @@ Loads MLX model, tokenizer, and config. Weight keys with a leading
 `model.` prefix (HF-style checkpoints) are normalized automatically;
 inner occurrences of `model.` in a key are preserved.
 
+Accepts either layout:
+
+- **Single file** — `weights.safetensors` (fast path).
+- **Sharded** — `weights.safetensors.index.json` plus
+  `weights-XXXXX-of-YYYYY.safetensors` parts (the HF/MLX layout for models
+  beyond a couple of hundred MB). The parts named by the index are loaded
+  and merged into one weight dict before the existing
+  `normalize_weight_keys` + `model.update` path runs.
+
+Both paths live in `weights.py` (`resolve_weights_paths`,
+`merge_weight_dicts`, `load_weights`) and are unit-tested in
+`tests/test_weights.py`.
+
 ### `generate_stream(model, tokenizer, prompt, max_new_tokens, temperature, verbose=False)`
 
-Yields text deltas token by token.
+Yields text deltas token by token. `temperature == 0` is greedy; a value
+above 0 samples from `softmax(logits / temperature)`, so a fixed `--seed`
+reproduces the whole sequence.
 
 ## Limitations
 
-- Greedy sampling only (temperature > 0 prints warning)
 - Single-prompt generation currently; batched inference in progress
 - Requires MLX-compatible models
 

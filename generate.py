@@ -7,6 +7,7 @@ import json
 from typing import List, Tuple, Dict, Generator
 from transformers import AutoTokenizer
 from model import Transformer
+from weights import load_weights, resolve_weights_paths
 
 def normalize_weight_keys(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
     """
@@ -44,15 +45,18 @@ def load_model(model_path: str) -> Tuple[Transformer, AutoTokenizer, Dict]:
     start_load = time.time()
 
     config_path = os.path.join(model_path, "config.json")
-    weights_path = os.path.join(model_path, "weights.safetensors")
     tokenizer_path = model_path
 
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found at {config_path}")
-    if not os.path.exists(weights_path):
-        raise FileNotFoundError(f"Weights file not found at {weights_path}")
     if not os.path.isdir(tokenizer_path):
          raise FileNotFoundError(f"Tokenizer path not found at {tokenizer_path}")
+
+    # Resolve the weight file(s): the single-file fast path, or the sharded
+    # weights.safetensors.index.json + parts layout (issue #17). Resolving
+    # here means a bad/missing checkpoint fails with a clear error before we
+    # have already spent time loading the config and tokenizer.
+    weights_paths = resolve_weights_paths(model_path)
 
     # Load configuration
     try:
@@ -78,21 +82,26 @@ def load_model(model_path: str) -> Tuple[Transformer, AutoTokenizer, Dict]:
     except Exception as e:
         raise RuntimeError(f"Error initializing model structure: {e}")
 
-    # Load weights, handling potential 'model.' prefix
+    # Load weights (single file or merged shards), handling potential 'model.' prefix
     try:
-        print(f"Loading weights from {weights_path}...")
-        weights = mx.load(weights_path)
-        
+        if len(weights_paths) > 1:
+            print(
+                f"Loading {len(weights_paths)} weight shards from {model_path}..."
+            )
+        else:
+            print(f"Loading weights from {weights_paths[0]}...")
+        weights = load_weights(weights_paths)
+
         # Remove a leading 'model.' prefix if present (see
         # normalize_weight_keys for why only the leading one).
         weights = normalize_weight_keys(weights)
-        
+
         model.update(weights) # Use update with the processed dictionary
         # model.load_weights(weights_path) # Original call replaced
         print("Weights loaded and applied.")
-        
+
     except Exception as e:
-        print(f"Error loading weights from {weights_path}: {e}")
+        print(f"Error loading weights from {weights_paths}: {e}")
         print("Ensure the model structure in model.py matches the weight names/shapes in the file (after potential prefix removal).")
         raise RuntimeError("Weight loading failed.")
 
@@ -120,6 +129,34 @@ def greedy_sample(logits: mx.array) -> mx.array:
     # Convert logits to probabilities
     return mx.argmax(logits, axis=-1)
 
+def temperature_sample(logits: mx.array, temperature: float) -> mx.array:
+    """
+    Samples a token from the logits scaled by 1/temperature.
+
+    Equivalent to softmax(logits / temperature) followed by a draw from the
+    resulting distribution — ``mx.random.categorical`` takes unnormalized
+    logits, so "scale then sample" is the whole trick. Low temperature
+    sharpens the distribution (tending toward greedy); high temperature
+    flattens it (tending toward uniform).
+
+    Purely a function of the logits and the global ``mx.random`` state, so a
+    fixed seed (the CLI's ``mx.random.seed(args.seed)``) makes the whole
+    generated sequence reproducible (issue #16).
+
+    Args:
+        logits (mx.array): logits tensor (batch_size, 1, vocab_size)
+        temperature (float): sampling temperature, must be > 0
+
+    Returns:
+        mx.array: the sampled token IDs (batch_size, 1)
+    """
+    if temperature <= 0.0:
+        raise ValueError(
+            f"temperature must be > 0 (got {temperature}); "
+            "use greedy_sample for greedy decoding"
+        )
+    return mx.random.categorical(logits / temperature)
+
 def generate_stream(
         model: Transformer,
         tokenizer: AutoTokenizer,
@@ -137,14 +174,16 @@ def generate_stream(
         tokenizer (AutoTokenizer): The loaded tokenizer.
         prompt (str): The input prompt string.
         max_new_tokens (int): Maximum number of new tokens to generate.
-        temperature (float): Sampling temperature. 0.0 means greedy. (Not fully implemented yet).
+        temperature (float): Sampling temperature. 0.0 means greedy;
+            values above 0.0 sample from softmax(logits / temperature)
+            (issue #16). With a fixed ``mx.random`` seed the output is
+            reproducible.
 
     Yields:
         Generator[str, None, None]: Yields text delta at each generation step.
     """
-    if temperature != 0.0:
-        print("Warning: Temperature > 0.0 requested, but only greedy sampling (temp=0.0) is implemented. Using greedy.")
-        # TODO: Implement proper temperature sampling
+    if temperature < 0.0:
+        raise ValueError(f"temperature must be >= 0.0, got {temperature}")
 
     print("Encoding prompt...")
     # Encode the prompt, add_special_tokens=True might be needed for some models
@@ -180,7 +219,10 @@ def generate_stream(
         if temperature == 0.0:
             next_token = greedy_sample(logits[:, -1, :])
         else:
-            next_token = greedy_sample(logits[:, -1, :])  # Placeholder for temperature sampling
+            # Real temperature sampling (issue #16): softmax over
+            # logits/temperature, drawn from the global mx.random state so a
+            # fixed --seed makes the output reproducible.
+            next_token = temperature_sample(logits[:, -1, :], temperature)
 
         token_id = next_token.item()
         generated_token_ids.append(token_id)

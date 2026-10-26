@@ -1,0 +1,14 @@
+# Exact pins for the CI gate (issue #18).
+#
+# requirements.txt keeps ranges so users get compatible newer versions;
+# this file pins what CI installs so a breaking upstream MLX/transformers
+# release can't flip the gate with no diff in this repo to point at.
+#
+# These are the versions the suite last went green on (run 38836178044,
+# 2026-10-16). Bump deliberately, and re-run the full suite locally on a
+# Mac before merging.
+mlx==0.32.4
+transformers==5.20.0
+safetensors==0.8.0
+numpy==2.5.4
+pytest==9.1.1
