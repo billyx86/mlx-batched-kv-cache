@@ -120,6 +120,34 @@ def greedy_sample(logits: mx.array) -> mx.array:
     # Convert logits to probabilities
     return mx.argmax(logits, axis=-1)
 
+def temperature_sample(logits: mx.array, temperature: float) -> mx.array:
+    """
+    Samples a token from the logits scaled by 1/temperature.
+
+    Equivalent to softmax(logits / temperature) followed by a draw from the
+    resulting distribution — ``mx.random.categorical`` takes unnormalized
+    logits, so "scale then sample" is the whole trick. Low temperature
+    sharpens the distribution (tending toward greedy); high temperature
+    flattens it (tending toward uniform).
+
+    Purely a function of the logits and the global ``mx.random`` state, so a
+    fixed seed (the CLI's ``mx.random.seed(args.seed)``) makes the whole
+    generated sequence reproducible (issue #16).
+
+    Args:
+        logits (mx.array): logits tensor (batch_size, 1, vocab_size)
+        temperature (float): sampling temperature, must be > 0
+
+    Returns:
+        mx.array: the sampled token IDs (batch_size, 1)
+    """
+    if temperature <= 0.0:
+        raise ValueError(
+            f"temperature must be > 0 (got {temperature}); "
+            "use greedy_sample for greedy decoding"
+        )
+    return mx.random.categorical(logits / temperature)
+
 def generate_stream(
         model: Transformer,
         tokenizer: AutoTokenizer,
@@ -137,14 +165,16 @@ def generate_stream(
         tokenizer (AutoTokenizer): The loaded tokenizer.
         prompt (str): The input prompt string.
         max_new_tokens (int): Maximum number of new tokens to generate.
-        temperature (float): Sampling temperature. 0.0 means greedy. (Not fully implemented yet).
+        temperature (float): Sampling temperature. 0.0 means greedy;
+            values above 0.0 sample from softmax(logits / temperature)
+            (issue #16). With a fixed ``mx.random`` seed the output is
+            reproducible.
 
     Yields:
         Generator[str, None, None]: Yields text delta at each generation step.
     """
-    if temperature != 0.0:
-        print("Warning: Temperature > 0.0 requested, but only greedy sampling (temp=0.0) is implemented. Using greedy.")
-        # TODO: Implement proper temperature sampling
+    if temperature < 0.0:
+        raise ValueError(f"temperature must be >= 0.0, got {temperature}")
 
     print("Encoding prompt...")
     # Encode the prompt, add_special_tokens=True might be needed for some models
@@ -180,7 +210,10 @@ def generate_stream(
         if temperature == 0.0:
             next_token = greedy_sample(logits[:, -1, :])
         else:
-            next_token = greedy_sample(logits[:, -1, :])  # Placeholder for temperature sampling
+            # Real temperature sampling (issue #16): softmax over
+            # logits/temperature, drawn from the global mx.random state so a
+            # fixed --seed makes the output reproducible.
+            next_token = temperature_sample(logits[:, -1, :], temperature)
 
         token_id = next_token.item()
         generated_token_ids.append(token_id)

@@ -3,8 +3,9 @@ Unit tests for generate.py helpers that are pure enough to test without a
 downloaded model (weight-key normalization, and the prefill->decode slicing
 that generate_stream depends on).
 """
+import pytest
 import mlx.core as mx
-from generate import normalize_weight_keys
+from generate import greedy_sample, normalize_weight_keys, temperature_sample
 
 
 class TestNormalizeWeightKeys:
@@ -89,6 +90,113 @@ class TestNextTokenSlicing:
         # Decode step returns (batch=1, seq_len=1, vocab=V) — must still work.
         mx.random.seed(2)
         logits = mx.random.normal((1, 1, 6))
-        token_id, current_token = self._extract(logits)
+        token_id, token_tensor = self._extract(logits)
         assert isinstance(token_id, int)
-        assert current_token.shape == (1, 1)
+        assert token_tensor.shape == (1, 1)
+
+
+class TestTemperatureSample:
+    """Real temperature sampling (issue #16).
+
+    temperature_sample must be a proper sampler: draw from
+    softmax(logits / T), reproducible under a fixed mx.random seed, and
+    collapse to greedy / uniform at the low / high temperature limits.
+    """
+
+    def _batched_draws(self, target: mx.array, temperature: float, n: int):
+        """n independent draws from softmax(target / temperature).
+
+        Repeats the same (1, 1, vocab) logits row n times along the batch
+        axis and calls temperature_sample once — one MLX op for n draws, so
+        these stay fast on the CI runner. Each row is an independent sample
+        from the identical distribution, which is exactly what we want to
+        estimate the distribution.
+        """
+        logits = mx.repeat(target[None, :, :], n, axis=0)  # (n, 1, vocab)
+        return temperature_sample(logits, temperature).reshape(-1)
+
+    def test_rejects_nonpositive_temperature(self):
+        logits = mx.random.normal((1, 1, 8))
+        with pytest.raises(ValueError):
+            temperature_sample(logits, 0.0)
+        with pytest.raises(ValueError):
+            temperature_sample(logits, -1.0)
+
+    def test_fixed_seed_reproducible(self):
+        """Same seed -> identical sampled tokens, two independent draws."""
+        logits = mx.random.normal((1, 1, 32))
+        mx.random.seed(123)
+        first = temperature_sample(logits, 1.0).reshape(-1).tolist()
+        mx.random.seed(123)
+        second = temperature_sample(logits, 1.0).reshape(-1).tolist()
+        assert first == second
+
+    def test_different_seeds_can_differ(self):
+        """Two seeds over 200 batched draws from a flat-ish distribution differ."""
+        logits = mx.random.normal((1, 200, 64))
+        mx.random.seed(1)
+        a = temperature_sample(logits, 1.0).reshape(-1).tolist()
+        mx.random.seed(2)
+        b = temperature_sample(logits, 1.0).reshape(-1).tolist()
+        assert a != b
+
+    def test_matches_reference_softmax_distribution(self):
+        """Empirical frequencies over many draws match softmax(logits / T)."""
+        vocab = 8
+        temp = 0.7
+        n = 20_000
+        mx.random.seed(99)
+        target = mx.random.normal((1, vocab))  # (1, vocab)
+        draws = self._batched_draws(target, temp, n)
+        onehot = mx.equal(
+            mx.arange(vocab)[None, :], draws.astype(mx.int32)[:, None]
+        ).astype(mx.float32)
+        empirical = onehot.sum(axis=0) / n
+        expected = mx.softmax(target[0] / temp)
+        assert mx.allclose(empirical, expected, atol=0.02).item(), (
+            empirical.tolist(),
+            expected.tolist(),
+        )
+
+    def test_low_temperature_tends_to_argmax(self):
+        """T -> 0 concentrates almost all mass on the max-logit token."""
+        target = mx.array([[0.0, 1.0, 5.0, 1.0, 0.0]])  # (1, vocab)
+        mx.random.seed(3)
+        draws = self._batched_draws(target, 0.05, 200)
+        assert int((draws == 2).sum()) >= 190
+
+    def test_high_temperature_is_near_uniform(self):
+        """T -> inf flattens the distribution over all tokens."""
+        target = mx.array([[0.0, 0.0, 10.0, 0.0]])  # (1, vocab=4)
+        n = 4000
+        mx.random.seed(11)
+        draws = self._batched_draws(target, 100.0, n)
+        for tok in range(4):
+            frac = float((draws == tok).sum()) / n
+            assert 0.15 <= frac <= 0.35, (tok, frac)
+
+    def test_output_shape_matches_greedy(self):
+        """(batch, 1, vocab) in -> (batch, 1) out, like greedy_sample."""
+        logits = mx.random.normal((1, 1, 16))
+        mx.random.seed(5)
+        sampled = temperature_sample(logits, 1.0)
+        greedy = greedy_sample(logits)
+        assert sampled.shape == greedy.shape
+        # The loop downstream does .item() then .reshape((1, 1)).
+        assert int(sampled.item()) == sampled.reshape((1, 1)).item()
+
+    def test_wired_into_generate_stream_path(self):
+        """generate_stream's decode branch must call temperature_sample, not greedy.
+
+        Pins the #16 fix: at temperature > 0 the loop no longer falls through
+        to greedy_sample. We can't run the model here, but we can assert the
+        sampling decision in the source uses the temperature branch.
+        """
+        import inspect
+
+        import generate
+
+        src = inspect.getsource(generate.generate_stream)
+        assert "temperature_sample(logits[:, -1, :], temperature)" in src
+        # The old placeholder must be gone.
+        assert "Placeholder for temperature sampling" not in src
