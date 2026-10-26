@@ -7,6 +7,7 @@ import json
 from typing import List, Tuple, Dict, Generator
 from transformers import AutoTokenizer
 from model import Transformer
+from weights import load_weights, resolve_weights_paths
 
 def normalize_weight_keys(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
     """
@@ -44,15 +45,18 @@ def load_model(model_path: str) -> Tuple[Transformer, AutoTokenizer, Dict]:
     start_load = time.time()
 
     config_path = os.path.join(model_path, "config.json")
-    weights_path = os.path.join(model_path, "weights.safetensors")
     tokenizer_path = model_path
 
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found at {config_path}")
-    if not os.path.exists(weights_path):
-        raise FileNotFoundError(f"Weights file not found at {weights_path}")
     if not os.path.isdir(tokenizer_path):
          raise FileNotFoundError(f"Tokenizer path not found at {tokenizer_path}")
+
+    # Resolve the weight file(s): the single-file fast path, or the sharded
+    # weights.safetensors.index.json + parts layout (issue #17). Resolving
+    # here means a bad/missing checkpoint fails with a clear error before we
+    # have already spent time loading the config and tokenizer.
+    weights_paths = resolve_weights_paths(model_path)
 
     # Load configuration
     try:
@@ -78,21 +82,26 @@ def load_model(model_path: str) -> Tuple[Transformer, AutoTokenizer, Dict]:
     except Exception as e:
         raise RuntimeError(f"Error initializing model structure: {e}")
 
-    # Load weights, handling potential 'model.' prefix
+    # Load weights (single file or merged shards), handling potential 'model.' prefix
     try:
-        print(f"Loading weights from {weights_path}...")
-        weights = mx.load(weights_path)
-        
+        if len(weights_paths) > 1:
+            print(
+                f"Loading {len(weights_paths)} weight shards from {model_path}..."
+            )
+        else:
+            print(f"Loading weights from {weights_paths[0]}...")
+        weights = load_weights(weights_paths)
+
         # Remove a leading 'model.' prefix if present (see
         # normalize_weight_keys for why only the leading one).
         weights = normalize_weight_keys(weights)
-        
+
         model.update(weights) # Use update with the processed dictionary
         # model.load_weights(weights_path) # Original call replaced
         print("Weights loaded and applied.")
-        
+
     except Exception as e:
-        print(f"Error loading weights from {weights_path}: {e}")
+        print(f"Error loading weights from {weights_paths}: {e}")
         print("Ensure the model structure in model.py matches the weight names/shapes in the file (after potential prefix removal).")
         raise RuntimeError("Weight loading failed.")
 
