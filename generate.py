@@ -4,7 +4,7 @@ import argparse
 import os
 import sys
 import json
-from typing import List, Tuple, Dict, Generator
+from typing import Tuple, Dict, Generator
 from transformers import AutoTokenizer
 from model import Transformer
 from weights import load_weights, resolve_weights_paths
@@ -178,6 +178,8 @@ def generate_stream(
             values above 0.0 sample from softmax(logits / temperature)
             (issue #16). With a fixed ``mx.random`` seed the output is
             reproducible.
+        verbose (bool): If True, print progress and per-step timing output
+            to stdout. Defaults to False (silent; issue #23).
 
     Yields:
         Generator[str, None, None]: Yields text delta at each generation step.
@@ -185,27 +187,30 @@ def generate_stream(
     if temperature < 0.0:
         raise ValueError(f"temperature must be >= 0.0, got {temperature}")
 
-    print("Encoding prompt...")
+    if verbose:
+        print("Encoding prompt...")
     # Encode the prompt, add_special_tokens=True might be needed for some models
     prompt_ids_np = tokenizer.encode(prompt, add_special_tokens=False, return_tensors="np")
     prompt_ids = mx.array(prompt_ids_np)
 
     if prompt_ids.shape[1] == 0:
         raise ValueError("Prompt is empty after encoding.")
-        return
-    
-    print(f"Processing prompt ({prompt_ids.shape[1]} tokens)...")
+
+    if verbose:
+        print(f"Processing prompt ({prompt_ids.shape[1]} tokens)...")
     start_time = time.time()
 
     # Process the prompt to initialize KV caches
     logits, kv_caches = model(prompt_ids, past_kv_caches=None)
 
-    prompt_time = time.time() - start_time
-    print(f"Prompt processing time: {prompt_time:.4f} seconds")
+    if verbose:
+        prompt_time = time.time() - start_time
+        print(f"Prompt processing time: {prompt_time:.4f} seconds")
 
     # Generation Loop Phase
     generated_token_ids = []
-    print("Generating tokens...")
+    if verbose:
+        print("Generating tokens...")
     loop_start_time = time.time()
 
     for i in range(max_new_tokens):
@@ -228,7 +233,8 @@ def generate_stream(
         generated_token_ids.append(token_id)
 
         if token_id == tokenizer.eos_token_id:
-            print(f"\nEnd of sequence token encountered at step {i}.")
+            if verbose:
+                print(f"\nEnd of sequence token encountered at step {i}.")
             break
             
         # Decode only the new token (O(1) per step instead of re-decoding the
@@ -247,12 +253,13 @@ def generate_stream(
             step_time = time.time() - step_start_time
             print(f"\nStep {i + 1}/{max_new_tokens} completed in {step_time:.4f} seconds.\n\n")
     
-    loop_time = time.time() - loop_start_time
-    total_gen_tokens = len(generated_token_ids)
-    print(f"\nGeneration loop finished in {loop_time:.4f} seconds")
-    print(f"Total tokens generated: {total_gen_tokens}")
-    if loop_time > 0 and total_gen_tokens > 0:
-        print(f"Average tokens per second: {total_gen_tokens / loop_time:.2f} tokens/sec")
+    if verbose:
+        loop_time = time.time() - loop_start_time
+        total_gen_tokens = len(generated_token_ids)
+        print(f"\nGeneration loop finished in {loop_time:.4f} seconds")
+        print(f"Total tokens generated: {total_gen_tokens}")
+        if loop_time > 0 and total_gen_tokens > 0:
+            print(f"Average tokens per second: {total_gen_tokens / loop_time:.2f} tokens/sec")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate text using a pre-trained MLX model with KV caching.")
