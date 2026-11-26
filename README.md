@@ -16,9 +16,9 @@ This project implements a transformer model with batched key-value caching for e
 
 ## Requirements
 
-- Apple Silicon Mac
+- Apple Silicon Mac (Metal) for fast inference, **or** Linux via the MLX CPU backend (`pip install mlx mlx-cpu` — slow generation, correct maths; sufficient for running the test suite)
 - Python 3.10+
-- MLX
+- MLX (`mlx`, plus `mlx-cpu` on Linux)
 - transformers
 - safetensors
 - numpy
@@ -66,12 +66,24 @@ python generate.py --model-path ./models/Mistral-7B-Instruct-v0.2-mlx \
 
 ## Testing
 
-Tests run on macOS ARM runners (MLX requires Apple Silicon):
+Run the test suite on macOS (Apple Silicon / Metal):
 
 ```bash
 pip install -r requirements.txt pytest
 pytest -q
 ```
+
+Or on Linux using the MLX CPU backend:
+
+```bash
+# Linux (CPU backend — suite only; generation is slow but correct)
+python -m venv .venv
+.venv/bin/pip install mlx==0.32.4 mlx-cpu==0.32.4 -r requirements-ci.txt
+.venv/bin/pytest -q
+```
+
+CI runs three jobs: `test` on macOS ARM / Metal, `test-linux` on Ubuntu CPU, and
+`lint` (`ruff`) on Ubuntu.
 
 The suite covers the causal mask (plain and chunked-prefill variants),
 GQA broadcast vs. repeat reference, KV-cache equivalence with a full
@@ -135,7 +147,7 @@ reproduces the whole sequence.
 
 ## Limitations
 
-- Single-prompt generation currently; batched inference in progress
+- The forward pass and KV cache are batched (`(B, T)` in, per-layer `(B, num_kv_heads, T, head_dim)` caches), but `generate_stream` is single-prompt only; there is no batched generation wrapper yet
 - Requires MLX-compatible models
 
 ## License
