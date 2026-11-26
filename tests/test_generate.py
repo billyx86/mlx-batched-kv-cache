@@ -3,9 +3,15 @@ Unit tests for generate.py helpers that are pure enough to test without a
 downloaded model (weight-key normalization, and the prefill->decode slicing
 that generate_stream depends on).
 """
+import numpy as np
 import pytest
 import mlx.core as mx
-from generate import greedy_sample, normalize_weight_keys, temperature_sample
+from generate import (
+    generate_stream,
+    greedy_sample,
+    normalize_weight_keys,
+    temperature_sample,
+)
 
 
 class TestNormalizeWeightKeys:
@@ -200,3 +206,71 @@ class TestTemperatureSample:
         assert "temperature_sample(logits[:, -1, :], temperature)" in src
         # The old placeholder must be gone.
         assert "Placeholder for temperature sampling" not in src
+
+
+class _StubModel:
+    """Minimal model stub returning (1, T, vocab) logits and echoing caches."""
+
+    def __init__(self, vocab: int = 4, target_token: int = 2):
+        self.vocab = vocab
+        self.target_token = target_token
+
+    def __call__(self, inputs: mx.array, past_kv_caches=None):
+        batch, seq_len = inputs.shape
+        one_hot = (
+            mx.equal(mx.arange(self.vocab), self.target_token).astype(mx.float32)
+            * 10.0
+        )
+        logits = mx.broadcast_to(
+            one_hot.reshape(1, 1, self.vocab), (batch, seq_len, self.vocab)
+        )
+        kv_caches = (
+            past_kv_caches
+            if past_kv_caches is not None
+            else [mx.zeros((1, 1, seq_len, 1))]
+        )
+        return logits, kv_caches
+
+
+class _StubTokenizer:
+    """Minimal tokenizer stub supporting encode(..., return_tensors='np') and decode."""
+
+    eos_token_id = 0
+
+    def __init__(self, encoded=None):
+        self._encoded = (
+            encoded if encoded is not None else np.array([[1, 2]], dtype=np.int32)
+        )
+        self._vocab = {1: "hello", 2: " world", 3: "!"}
+
+    def encode(self, prompt, add_special_tokens=False, return_tensors="np"):
+        return self._encoded
+
+    def decode(self, token_ids, skip_special_tokens=True):
+        return "".join(self._vocab[t] for t in token_ids)
+
+
+class TestGenerateStream:
+    """Silence by default, verbose progress output, and empty-prompt guard (#20, #23)."""
+
+    def test_no_stdout_by_default(self, capsys):
+        model = _StubModel()
+        tokenizer = _StubTokenizer()
+        tokens = list(generate_stream(model, tokenizer, "hello", 3))
+        assert len(tokens) == 3
+        assert capsys.readouterr().out == ""
+
+    def test_verbose_prints_progress(self, capsys):
+        model = _StubModel()
+        tokenizer = _StubTokenizer()
+        tokens = list(generate_stream(model, tokenizer, "hello", 3, verbose=True))
+        assert len(tokens) == 3
+        out = capsys.readouterr().out
+        assert "Encoding prompt..." in out
+        assert "Generating tokens..." in out
+
+    def test_empty_prompt_still_raises(self):
+        model = _StubModel()
+        tokenizer = _StubTokenizer(encoded=np.empty((1, 0), dtype=np.int32))
+        with pytest.raises(ValueError):
+            list(generate_stream(model, tokenizer, "", 3))
