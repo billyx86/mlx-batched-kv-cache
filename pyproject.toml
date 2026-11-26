@@ -4,3 +4,12 @@ pythonpath = ["."]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+
+[tool.ruff]
+# Pinned rule set: the defaults plus the obvious-correctness rules. Deliberately
+# NOT the full "E" set — E501 (line length) would churn the whole tree for no
+# behavioural gain. Bump deliberately, like the CI pins (issue #22).
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

@@ -1,7 +1,6 @@
 """
 Unit tests for mlx-batched-kv-cache model components.
 """
-import pytest
 import mlx.core as mx
 from model import (
     RoPE,

@@ -8,7 +8,10 @@ on:
 jobs:
   test:
     # MLX requires Apple Silicon, so tests run on the macOS ARM runners.
-    runs-on: macos-14
+    # macos-14 is no longer a supported runner configuration on this account
+    # (jobs fail instantly with "configuration 'macos-14-arm64-us-default' is
+    # not supported", 2026-11-26), so track macos-latest (currently macos-15 arm64).
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -25,3 +28,40 @@ jobs:
 
       - name: Run tests
         run: pytest -q
+
+  test-linux:
+    # MLX ships a Linux CPU backend (mlx bindings + mlx-cpu shared library), so
+    # the pure Python surface — masks, GQA broadcast, KV-cache equivalence,
+    # weight-key handling — is gated here too, without waiting on a macOS runner
+    # (issue #21). Metal-specific regressions still need the macOS job.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-ci.txt
+
+      - name: Run tests
+        run: pytest -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        # Pinned so a new ruff release can't flip the gate with no diff here.
+        run: pip install ruff==0.8.6
+
+      - name: Ruff
+        run: ruff check .

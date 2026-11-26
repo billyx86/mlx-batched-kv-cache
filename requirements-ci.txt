@@ -12,3 +12,6 @@ transformers==5.20.0
 safetensors==0.8.0
 numpy==2.5.4
 pytest==9.1.1
+# Linux CPU backend: the `mlx` wheel is bindings only — libmlx.so ships in
+# `mlx-cpu`. The marker keeps the macOS (Metal) job byte-identical.
+mlx-cpu==0.32.4; sys_platform == "linux"
