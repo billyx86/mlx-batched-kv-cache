@@ -8,7 +8,6 @@ MLX-touching path (``load_weights``) is covered by the missing-shard
 """
 import json
 import os
-import tempfile
 
 import pytest
 

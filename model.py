@@ -1,6 +1,5 @@
 import mlx.core as mx
 import mlx.nn as nn
-import math
 from typing import Optional, Tuple, List, Dict
 
 from mlx.nn import QuantizedLinear
@@ -97,7 +96,8 @@ class Attention(nn.Module):
         keys = keys.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
         values = values.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim).transpose(0, 2, 1, 3)
 
-        if rope is None: raise ValueError("RoPE module must be provided.")
+        if rope is None:
+            raise ValueError("RoPE module must be provided.")
         queries = rope(queries, offset=offset)
         keys = rope(keys, offset=offset)
 
@@ -120,7 +120,8 @@ class Attention(nn.Module):
         # Expand keys to 5 dims so the matmul broadcasts over the group axis
         keys_t = keys[:, :, None].transpose(0, 1, 2, 4, 3)  # (B, KV, 1, D, T_k)
         scores = (queries @ keys_t) * self.scale  # (B, KV, G, T, T_k)
-        if mask is not None: scores = scores + mask
+        if mask is not None:
+            scores = scores + mask
         attention_weights = mx.softmax(scores.astype(mx.float32), axis=-1).astype(scores.dtype)
         # Broadcast values over the group axis: (B, KV, 1, T_k, D)
         attention_output = attention_weights @ values[:, :, None]
@@ -252,7 +253,8 @@ class Transformer(nn.Module):
                 # offset == cached prefix length (set above when a cache exists)
                 mask = make_causal_mask_with_prefix(inputs.shape[1], offset)
 
-        if past_kv_caches is None: past_kv_caches = [None] * self.num_hidden_layers
+        if past_kv_caches is None:
+            past_kv_caches = [None] * self.num_hidden_layers
         if len(past_kv_caches) != self.num_hidden_layers:
              raise ValueError(f"Incorrect num caches. Expected {self.num_hidden_layers}, got {len(past_kv_caches)}")
 
