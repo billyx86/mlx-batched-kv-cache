@@ -8,7 +8,10 @@ on:
 jobs:
   test:
     # MLX requires Apple Silicon, so tests run on the macOS ARM runners.
-    runs-on: macos-14
+    # macos-14 is no longer a supported runner configuration on this account
+    # (jobs fail instantly with "configuration 'macos-14-arm64-us-default' is
+    # not supported", 2026-11-26), so track macos-latest (currently macos-15 arm64).
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
